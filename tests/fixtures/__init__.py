@@ -1,0 +1,1 @@
+"""Fixtures init for tests."""
