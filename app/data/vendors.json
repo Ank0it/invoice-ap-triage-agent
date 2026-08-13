@@ -1,0 +1,42 @@
+[
+  {
+    "vendor_id": "V-101",
+    "name": "Acme Supplies Pvt Ltd",
+    "tax_id": "GST-123",
+    "email": "ap@acmesupplies.com",
+    "currency": "USD",
+    "active": true
+  },
+  {
+    "vendor_id": "V-102",
+    "name": "Apex Industrial Corp",
+    "tax_id": "GST-456",
+    "email": "billing@apexindustrial.com",
+    "currency": "USD",
+    "active": true
+  },
+  {
+    "vendor_id": "V-103",
+    "name": "Acme Supplies Pvt Ltd",
+    "tax_id": "GST-789",
+    "email": "ap@acmesupplies-dubai.com",
+    "currency": "USD",
+    "active": true
+  },
+  {
+    "vendor_id": "V-104",
+    "name": "Beta Logistics Ltd",
+    "tax_id": "GST-321",
+    "email": "invoices@betalogistics.com",
+    "currency": "USD",
+    "active": true
+  },
+  {
+    "vendor_id": "V-105",
+    "name": "Gamma Industrial Supplies",
+    "tax_id": "GST-654",
+    "email": "ar@gamma-industrial.com",
+    "currency": "EUR",
+    "active": true
+  }
+]

@@ -1,0 +1,80 @@
+[
+  {
+    "po_number": "PO-88021",
+    "vendor_id": "V-101",
+    "status": "OPEN",
+    "currency": "USD",
+    "expected_total": 1250.00,
+    "line_items": [
+      {
+        "product_code": "PRD-001",
+        "description": "Industrial Bearings",
+        "quantity": 5,
+        "unit_price": 100.00
+      },
+      {
+        "product_code": "PRD-002",
+        "description": "Hydraulic Seals",
+        "quantity": 10,
+        "unit_price": 25.00
+      },
+      {
+        "product_code": "PRD-003",
+        "description": "Steel Shafts",
+        "quantity": 2,
+        "unit_price": 75.00
+      }
+    ]
+  },
+  {
+    "po_number": "PO-88022",
+    "vendor_id": "V-101",
+    "status": "OPEN",
+    "currency": "USD",
+    "expected_total": 2750.00,
+    "line_items": [
+      {
+        "product_code": "PRD-004",
+        "description": "Control Valves",
+        "quantity": 5,
+        "unit_price": 350.00
+      },
+      {
+        "product_code": "PRD-005",
+        "description": "Pressure Gauges",
+        "quantity": 20,
+        "unit_price": 25.00
+      }
+    ]
+  },
+  {
+    "po_number": "PO-88023",
+    "vendor_id": "V-102",
+    "status": "OPEN",
+    "currency": "USD",
+    "expected_total": 500.00,
+    "line_items": [
+      {
+        "product_code": "PRD-006",
+        "description": "Safety Helmets",
+        "quantity": 20,
+        "unit_price": 25.00
+      }
+    ]
+  },
+  {
+    "po_number": "PO-88024",
+    "vendor_id": "V-104",
+    "status": "OPEN",
+    "currency": "USD",
+    "expected_total": 1500.00,
+    "line_items": [
+      {
+        "product_code": "PRD-007",
+        "description": "Packaging Tape",
+        "quantity": 100,
+        "unit_price": 15.00
+      }
+    ]
+  }
+]
