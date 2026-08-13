@@ -26,272 +26,464 @@ Invoice processing is a repetitive, high-volume business workflow where:
 
 This makes it an ideal domain for evaluating tool-grounded agents.
 
-## 3. Workflow
+## 3. Workflow overview
 
-```text
-Invoice document
-       ↓
-inspect_document
-       ↓
-extract_invoice
-       ↓
-lookup_vendor
-       ↓
-lookup_purchase_order   (only if PO number was extracted)
-       ↓
-match_invoice_to_po     (only if PO was found)
-       ↓
-check_duplicate_invoice (only if vendor was resolved)
-       ↓
-final decision
+The system implements an **Invoice Intake & Accounts Payable (AP) Exception Triage** workflow. An AP team receives an invoice that must be checked before it can proceed for review or payment processing. The agent automates the initial fact-finding and validation steps, but the final decision is always evidence-constrained.
+
+The workflow in practical business terms:
+
+1. **Receive invoice** — An AP clerk uploads an invoice document.
+2. **Inspect document** — The system checks whether the document is usable (supported format, readable, text detected).
+3. **Extract information** — Structured fields are extracted from the document: invoice number, dates, vendor, PO reference, amounts, line items, etc.
+4. **Identify vendor** — The extracted vendor name is looked up in business data to obtain a vendor ID.
+5. **Retrieve purchase order** — If a PO number was extracted, the corresponding PO is retrieved.
+6. **Compare invoice to PO** — Quantities, unit prices, totals, and currency are compared deterministically.
+7. **Check for duplicates** — The system checks whether the same invoice has already been processed.
+8. **Route for review** — Based on the evidence, the invoice is classified as `READY_FOR_REVIEW` (sufficient evidence for human review), `NEEDS_REVIEW` (exceptions found), or `REJECTED_DOCUMENT` (unusable).
+
+The system **never invents** missing invoice information. If a PO number is missing, the system does not look up a fake PO. If the document is blurry, extracted values remain `null` with an appropriate uncertainty status.
+
+## 4. System architecture
+
+```mermaid
+flowchart TD
+    A[User] --> B[FastAPI / CLI]
+    B --> C[InvoiceAgent / LLMInvoiceAgent]
+    C --> D{Agent Mode}
+    D -->|deterministic| E[State Machine]
+    D -->|llm| F[LLM Orchestrator]
+    F --> G[validate_tool_call]
+    G -->|valid| H[execute_tool]
+    G -->|invalid| I[Structured Error]
+    H --> J[update_state]
+    J --> K[Tool Result]
+    K --> F
+    F -->|final decision| L[validate_final_decision]
+    E --> L
+    L --> M[DecisionResult]
+    I --> M
 ```
 
-The exact sequence depends on tool results. For example:
-
-- If inspection reports `NO_TEXT_DETECTED` → stop, return `NEEDS_REVIEW`.
-- If extraction returns no PO number → skip `lookup_purchase_order`, return `NEEDS_REVIEW`.
-- If vendor lookup returns `AMBIGUOUS` → do not select a vendor, return `NEEDS_REVIEW`.
-
-## 4. Architecture
-
-```text
-app/
-├── agent/
-│   ├── orchestrator.py    # Deterministic state machine (InvoiceAgent)
-│   ├── llm_orchestrator.py # LLM-driven orchestration (LLMInvoiceAgent)
-│   ├── llm_client.py      # LLM client wrapper with mock support
-│   ├── state.py           # State helpers (terminal state, next step)
-│   ├── prompts.py         # System prompt for the agent
-│   ├── tool_schemas.py    # Tool definitions for LLM function calling
-│   └── validators.py      # Argument and final-decision validators
-├── tools/
-│   ├── document.py        # inspect_document
-│   ├── extraction.py      # extract_invoice (PDF text + regex parsing)
-│   ├── vendor.py          # lookup_vendor
-│   ├── purchase_order.py  # lookup_purchase_order
-│   ├── matching.py        # match_invoice_to_po
-│   ├── duplicate.py       # check_duplicate_invoice
-│   └── runner.py          # Shared tool execution logic
-├── models/
-│   ├── invoice.py         # ExtractedInvoice, InvoiceField, CurrencyValue, etc.
-│   ├── tool_result.py     # AgentState, ToolResult
-│   └── decision.py        # DecisionResult, MatchResult, ExceptionCode, etc.
-├── data/
-│   ├── vendors.json
-│   ├── purchase_orders.json
-│   └── processed_invoices.json
-├── api/
-│   └── routes.py          # FastAPI endpoint
-└── main.py                # App factory
+```mermaid
+flowchart TD
+    A[User<br/>Invoice PDF/Image] --> B[FastAPI / CLI<br/>Input + Routing]
+    B --> C{Agent Mode}
+    C -->|deterministic| D[Deterministic<br/>Workflow Engine]
+    C -->|llm| E[LLM Agent<br/>LLMInvoiceAgent]
+    E --> F[Tool selection]
+    F --> G[Tool Call Validator<br/>• State validation<br/>• Argument checks<br/>• Dependency checks]
+    D --> H[Tool Execution Layer<br/>• inspect_document<br/>• extract_invoice<br/>• lookup_vendor<br/>• lookup_purchase_order<br/>• match_invoice_to_po<br/>• check_duplicate_invoice]
+    G -->|valid| H
+    G -->|invalid| I[Structured Error]
+    H --> J[Agent State / Trace<br/>• extracted fields<br/>• vendor information<br/>• PO information<br/>• match results<br/>• duplicate status<br/>• tool execution trace]
+    J --> E
+    E --> K{More tools needed?}
+    K -->|YES| E
+    K -->|NO| L[Final Decision Validator<br/>Prevents LLM from:<br/>• overriding PO fail<br/>• ignoring missing<br/>• inventing values]
+    I --> M[DecisionResult<br/>READY_FOR_REVIEW<br/>NEEDS_REVIEW<br/>REJECTED_DOCUMENT]
+    L --> M
 ```
-
-## 5. Agent / tool loop
-
-Two modes are available:
 
 ### Deterministic mode (default)
 
-`InvoiceAgent` maintains an explicit `AgentState` and executes tools one at a time:
-
-1. **inspect_document** — determines format, page count, readability, text availability, and quality flags.
-2. **extract_invoice** — extracts structured fields with confidence/status from PDF text using deterministic regex.
-3. **lookup_vendor** — matches the extracted vendor name against fixture data.
-4. **lookup_purchase_order** — retrieves PO details using the extracted PO number.
-5. **match_invoice_to_po** — deterministic comparison of vendor, currency, line items, quantities, unit prices, and totals.
-6. **check_duplicate_invoice** — checks vendor ID + invoice number against processed invoices.
+A reproducible state-machine workflow that executes the known business workflow without requiring an LLM. The `InvoiceAgent` class maintains explicit `AgentState` and processes tools in a defined sequence, skipping steps when prerequisites are missing.
 
 ### LLM mode
 
-`LLMInvoiceAgent` wraps the same deterministic tools. The LLM acts as an orchestrator that:
+The `LLMInvoiceAgent` wraps the same deterministic tools. The LLM acts as an orchestrator that:
 
 - Observes the document and extracted fields.
-- Decides which tool to call next.
+- Decides which tool to call next using function/tool calling.
 - Receives structured tool results.
 - Decides whether more evidence is required or if a final decision can be made.
 
 The LLM never becomes the source of truth for business facts. All invoice totals, vendor IDs, PO amounts, and match results come from deterministic tools.
 
+## 5. Detailed tool-calling workflow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Agent
+    participant I as inspect_document
+    participant E as extract_invoice
+    participant V as lookup_vendor
+    participant P as lookup_purchase_order
+    participant M as match_invoice_to_po
+    participant D as check_duplicate_invoice
+    participant F as Final Validator
+
+    U->>A: Upload invoice
+    A->>I: inspect_document(path)
+    I-->>A: supported, readable, quality_flags
+    alt document unreadable
+        A->>F: validate_final_decision
+        F-->>U: NEEDS_REVIEW / REJECTED_DOCUMENT
+    else document readable
+        A->>E: extract_invoice(path, inspection)
+        E-->>A: ExtractedInvoice{po_number, vendor_name, total, ...}
+        A->>V: lookup_vendor(extracted_name)
+        V-->>A: UNIQUE / NONE / AMBIGUOUS
+        alt vendor AMBIGUOUS
+            A->>F: validate_final_decision
+            F-->>U: NEEDS_REVIEW
+        else vendor resolved
+            alt po_number extracted
+                A->>P: lookup_purchase_order(extracted_po)
+                P-->>A: PO data or NOT_FOUND
+                alt PO FOUND
+                    A->>M: match_invoice_to_po(extraction, po_data)
+                    M-->>A: MatchResult{overall, checks, exceptions}
+                end
+            end
+            A->>D: check_duplicate_invoice(vendor_id, invoice_number)
+            D-->>A: duplicate: bool
+            A->>F: validate_final_decision
+            F-->>U: READY_FOR_REVIEW / NEEDS_REVIEW
+        end
+    end
+```
+
+### Tool-call dependency example
+
+A critical property of the system is that later tool calls depend on earlier results:
+
+```
+extract_invoice
+    ↓
+po_number = "PO-88021"
+    ↓
+lookup_purchase_order("PO-88021")
+    ↓
+PO result: {expected_total: 1250.00, ...}
+    ↓
+match_invoice_to_po(...)
+    ↓
+total_match: FAIL
+    ↓
+NEEDS_REVIEW
+```
+
+The PO number passed to `lookup_purchase_order` comes from the extraction result. If extraction returns no PO number, the PO lookup is skipped and the workflow moves toward `NEEDS_REVIEW` rather than inventing a value.
+
+## 6. LLM tool-calling loop
+
+When running in LLM mode, the agent follows this loop:
+
+```mermaid
+flowchart TD
+    A[User document] --> B[LLM]
+    B --> C{Proposes tool call?}
+    C -->|yes| D[validate_tool_call]
+    D -->|invalid| E[Reject / safe handling]
+    D -->|valid| F[execute_tool]
+    F --> G[Structured tool result]
+    G --> H[update agent state]
+    H --> I[Append result to conversation]
+    I --> B
+    C -->|no| J{Final decision?}
+    J -->|yes| K[validate_final_decision]
+    K -->|invalid| L[Override to NEEDS_REVIEW]
+    K -->|valid| M[DecisionResult]
+    J -->|no| B
+    E --> N[Terminate safely]
+    L --> M
+```
+
+Key properties:
+
+- **Tool calls are not blindly trusted.** Arguments are validated against the current agent state before execution.
+- **Fake PO numbers are rejected.** If the LLM proposes `lookup_purchase_order("PO-FAKE")` but extraction returned `po_number = null`, the call is rejected with `UNSUPPORTED_TOOL_ARGUMENT`.
+- **The LLM cannot override deterministic mismatch evidence.** If `match_invoice_to_po` reports `TOTAL_MISMATCH`, the final decision validator will not allow `READY_FOR_REVIEW`.
+- **The loop has a maximum tool-call limit** (default: 10). Reaching the limit terminates the workflow as `NEEDS_REVIEW`.
+- **Tool failures terminate or route safely** rather than causing fabricated results.
+
+## 7. Extraction pipeline
+
 ```text
-User
+Document
   ↓
-LLM InvoiceAgent
+inspect_document
   ↓
-LLM tool selection (function calling)
+PDF/text extraction (pdfplumber)
   ↓
-Existing deterministic tool
+deterministic parsing / regex
   ↓
-Structured tool result
+structured ExtractedInvoice
   ↓
-LLM observes result
-  ↓
-Next tool OR final decision
+confidence / status / source evidence
 ```
 
-## 6. Extraction schema
+### Extracted fields
 
-Every extracted field is represented as:
+The extraction supports the following fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `vendor_name` | `InvoiceField` | Extracted vendor name |
+| `vendor_tax_id` | `InvoiceField` | Extracted tax ID / GST |
+| `invoice_number` | `InvoiceField` | Extracted invoice number |
+| `invoice_date` | `InvoiceField` | Extracted invoice date |
+| `due_date` | `InvoiceField` | Extracted due date |
+| `po_number` | `InvoiceField` | Extracted PO number |
+| `currency` | `InvoiceField` | Extracted currency code |
+| `payment_terms` | `InvoiceField` | Extracted payment terms |
+| `subtotal` | `CurrencyValue` | Extracted subtotal amount |
+| `discount` | `CurrencyValue` | Extracted discount amount |
+| `tax` | `CurrencyValue` | Extracted tax amount |
+| `shipping` | `CurrencyValue` | Extracted shipping amount |
+| `total` | `CurrencyValue` | Extracted total amount |
+| `amount_due` | `CurrencyValue` | Extracted amount due |
+| `line_items` | `List[LineItem]` | Extracted line items |
+
+### Line-item fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `description` | `InvoiceField` | Item description |
+| `product_code` | `InvoiceField` | Product code |
+| `quantity` | `InvoiceField` | Quantity ordered |
+| `unit_price` | `CurrencyValue` | Price per unit |
+| `line_total` | `CurrencyValue` | Total for the line |
+
+### Field metadata
+
+Every extracted field preserves:
+
+- `value` — the extracted value (or `null` if missing)
+- `confidence` — parser certainty (0.0–1.0); represents parser certainty, not OCR probability
+- `status` — one of the statuses below
+- `source_text` — the raw text from which the value was extracted
+- `source_page` — page number where supported
+- `candidates` — alternative values when status is `CONFLICTING`
+
+### Field statuses
+
+| Status | Meaning |
+|--------|---------|
+| `FOUND` | Value extracted with high confidence. |
+| `MISSING` | Field not present in the document. |
+| `UNCERTAIN` | Value inferred or derived, not directly extracted. |
+| `UNREADABLE` | Document quality prevented reliable extraction. |
+| `CONFLICTING` | Multiple candidate values were found. |
+
+## 8. No-hallucination / reliability architecture
+
+The system is designed so that the LLM cannot introduce fabricated business facts:
+
+```mermaid
+flowchart TD
+    A[LLM proposed tool call] --> B[Tool-call validator]
+    B -->|invalid| C[Reject / safe handling]
+    B -->|valid| D[deterministic tool]
+    D --> E[structured evidence]
+    E --> F[update state]
+    
+    G[LLM proposed final decision] --> H[Final decision validator]
+    H -->|evidence does not support| I[Override to NEEDS_REVIEW]
+    H -->|evidence supports| J[Accept decision]
+```
+
+Key guarantees:
+
+- **Missing values remain null.** If OCR cannot read the invoice number, the field returns `null` with status `MISSING` or `UNREADABLE`.
+- **Unreadable fields are not fabricated.** The model cannot turn `INV-10??` into `INV-1002` unless the document evidence supports it.
+- **Fake PO references are rejected.** `lookup_purchase_order` arguments are validated against the extracted PO number.
+- **Ambiguous vendors are not arbitrarily selected.** If multiple vendors match, the status is `AMBIGUOUS` and the workflow routes to `NEEDS_REVIEW`.
+- **PO mismatches cannot be overridden by the LLM.** The final decision validator checks deterministic match results.
+- **Duplicate detection is deterministic.** Vendor ID + invoice number is checked against processed invoices.
+- **The LLM does not create business facts.** It only decides which tools to call.
+
+## 9. Decision flow
+
+The final decision is one of three statuses:
+
+| Status | Meaning |
+|--------|---------|
+| `READY_FOR_REVIEW` | Sufficient evidence collected; invoice is ready for human AP review. |
+| `NEEDS_REVIEW` | Exceptions found (missing data, mismatches, duplicates, ambiguous vendor, etc.); human intervention required. |
+| `REJECTED_DOCUMENT` | Document is unsupported or unreadable; cannot be processed. |
+
+### Decision examples
+
+| Scenario | Outcome |
+|----------|---------|
+| Clean invoice, all checks pass, no duplicate | `READY_FOR_REVIEW` |
+| Missing PO number | `NEEDS_REVIEW` |
+| Unknown vendor | `NEEDS_REVIEW` |
+| Ambiguous vendor (multiple matches) | `NEEDS_REVIEW` |
+| PO total mismatch | `NEEDS_REVIEW` |
+| Unit price mismatch | `NEEDS_REVIEW` |
+| Quantity mismatch | `NEEDS_REVIEW` |
+| Duplicate invoice | `NEEDS_REVIEW` |
+| Blurry / unreadable document | `NEEDS_REVIEW` |
+| Unsupported format | `REJECTED_DOCUMENT` |
+| No text detected in document | `NEEDS_REVIEW` |
+| Maximum tool-call limit reached | `NEEDS_REVIEW` |
+| Tool execution failure | `NEEDS_REVIEW` |
+
+## 10. Failure and edge-case workflow
+
+| Scenario | System behavior | Expected outcome |
+|----------|----------------|------------------|
+| Clean invoice | All tools succeed, all checks pass | `READY_FOR_REVIEW` |
+| Missing PO number | PO lookup skipped, no PO data to match | `NEEDS_REVIEW` |
+| Missing total | Extraction returns `null` total with `MISSING` status | `NEEDS_REVIEW` |
+| Blurry document | Inspection flags `BLURRY` or `NO_TEXT_DETECTED` | `NEEDS_REVIEW` |
+| Blank document | No text extracted, fields remain `MISSING` | `NEEDS_REVIEW` |
+| Partial / cropped document | Some fields extracted, others missing | `NEEDS_REVIEW` |
+| Unknown vendor | Vendor lookup returns `NONE` | `NEEDS_REVIEW` |
+| Ambiguous vendor | Vendor lookup returns `AMBIGUOUS` | `NEEDS_REVIEW` |
+| Wrong quantity | Match detects quantity mismatch | `NEEDS_REVIEW` |
+| Wrong unit price | Match detects unit price mismatch | `NEEDS_REVIEW` |
+| Wrong total | Match detects total mismatch | `NEEDS_REVIEW` |
+| Duplicate invoice | Duplicate check finds existing record | `NEEDS_REVIEW` |
+| Same invoice number, different vendor | Duplicate check returns no match | Not a duplicate |
+| Vague request with document | Interpreted as invoice processing | Processed normally |
+| Vague request without document | No document provided | `NEEDS_REVIEW` |
+| Invalid/fake PO proposed by LLM | Validator rejects tool call | `NEEDS_REVIEW` |
+| LLM tries to override deterministic mismatch | Final validator prevents override | `NEEDS_REVIEW` |
+| Tool failure | Exception caught, `TOOL_FAILURE` recorded | `NEEDS_REVIEW` |
+| Maximum tool-call limit | Loop terminates safely | `NEEDS_REVIEW` |
+
+## 11. Concrete end-to-end example
+
+Using actual fixture data (`clean_invoice_03.pdf`):
+
+```text
+1. inspect_document
+   → supported=true, readable=true, flags=[]
+
+2. extract_invoice
+   → invoice_number = INV-8888
+   → po_number = PO-88021
+   → vendor_name = Acme Supplies Pvt Ltd
+   → vendor_tax_id = GST-123
+   → total = 1250.00
+   → currency = USD
+   → line_items: 3 items
+
+3. lookup_vendor("Acme Supplies Pvt Ltd", "GST-123")
+   → status = UNIQUE
+   → vendor_id = V-101
+
+4. lookup_purchase_order("PO-88021")
+   → status = FOUND
+   → expected_total = 1250.00
+   → line_items: 3 items
+
+5. match_invoice_to_po
+   → vendor_match = PASS
+   → po_number_match = PASS
+   → currency_match = PASS
+   → line_items_match = PASS
+   → quantity_match = PASS
+   → unit_price_match = PASS
+   → total_match = PASS
+   → overall = PASS
+
+6. check_duplicate_invoice("V-101", "INV-8888")
+   → duplicate = false
+
+7. Final validation
+   → READY_FOR_REVIEW
+```
+
+Tool trace:
 
 ```json
-{
-  "value": "INV-1042",
-  "confidence": 0.98,
-  "status": "FOUND",
-  "source_page": 1,
-  "source_text": "Invoice No: INV-1042"
-}
+[
+  {"step": 1, "tool": "inspect_document", "success": true},
+  {"step": 2, "tool": "extract_invoice", "success": true},
+  {"step": 3, "tool": "lookup_vendor", "success": true},
+  {"step": 4, "tool": "lookup_purchase_order", "success": true},
+  {"step": 5, "tool": "match_invoice_to_po", "success": true},
+  {"step": 6, "tool": "check_duplicate_invoice", "success": true}
+]
 ```
 
-Supported statuses:
+## 12. Why the agent is safe
 
-- `FOUND` — value extracted with high confidence.
-- `MISSING` — field not present in the document.
-- `UNCERTAIN` — value inferred or derived, not directly extracted.
-- `UNREADABLE` — document quality prevented reliable extraction.
-- `CONFLICTING` — multiple candidate values were found.
+> "The LLM decides what to ask the tools; the tools decide what is true."
 
-Confidence represents parser certainty, not OCR probability.
+| Layer | Responsibility |
+|-------|----------------|
+| **LLM** | Orchestration only. Decides which tool to call next. Cannot generate business facts. |
+| **Document extraction** | Provides document evidence. Fields carry confidence and status. Missing values stay null. |
+| **Vendor / PO lookup** | Provides business evidence from deterministic fixture data. |
+| **Matching** | Deterministic comparison of quantities, prices, totals, and currency. |
+| **Duplicate check** | Deterministic identity check using vendor_id + invoice_number. |
+| **Validators** | Safety boundary. Reject invalid tool arguments. Prevent LLM from overriding deterministic evidence. |
+| **Final decision** | Constrained by evidence. Cannot return `READY_FOR_REVIEW` when mismatches or missing data exist. |
 
-## 7. Tool contracts
+This separation ensures that even if the LLM makes a poor orchestration decision, the underlying tools and validators prevent fabricated or unsupported outcomes.
 
-### inspect_document(document_path)
+## 13. Project structure
 
-Returns:
+```text
+app/
+  agent/
+    __init__.py
+    llm_client.py          # MockLLMClient + OpenAIClient
+    llm_orchestrator.py    # LLM-driven agent loop
+    orchestrator.py        # Deterministic state machine
+    prompts.py             # System prompt
+    state.py               # State helpers
+    tool_schemas.py        # Tool definitions for LLM function calling
+    validators.py          # Argument and final-decision validators
+  api/
+    routes.py              # FastAPI endpoint
+  cli.py                   # CLI entry point
+  data/
+    processed_invoices.json
+    purchase_orders.json
+    vendors.json
+  main.py                  # FastAPI app factory
+  models/
+    decision.py            # DecisionResult, MatchResult, ExceptionCode
+    invoice.py             # ExtractedInvoice, InvoiceField, CurrencyValue
+    tool_result.py         # AgentState, ToolResult
+  tools/
+    document.py            # inspect_document
+    duplicate.py           # check_duplicate_invoice
+    extraction.py          # extract_invoice
+    matching.py            # match_invoice_to_po
+    purchase_order.py      # lookup_purchase_order
+    runner.py              # Shared tool execution logic
+    vendor.py              # lookup_vendor
 
-```json
-{
-  "supported": true,
-  "page_count": 1,
-  "readable": true,
-  "text_detected": true,
-  "quality_flags": [],
-  "file_type": "pdf",
-  "file_size_bytes": 1234
-}
+tests/
+  conftest.py
+  fixtures/
+    generator.py
+  test_agent.py
+  test_api.py
+  test_edge_cases.py
+  test_extraction.py
+  test_llm_agent.py
+  test_tools.py
 ```
 
-### extract_invoice(document_path, inspection?)
+## 14. Testing and requirement coverage
 
-Returns `ExtractedInvoice` with all required fields.
+The repository contains **66 passing tests** covering:
 
-### lookup_vendor(name, tax_id?)
+- Document inspection (supported, unsupported, blank, quality flags)
+- Extraction (clean, blurry, blank, partial, fields, dates, currency, vendor, tax)
+- Vendor lookup (unique, ambiguous, unknown, tax ID filter)
+- Purchase order lookup (existing, missing, case insensitive, empty)
+- Invoice-to-PO matching (perfect match, total mismatch, unit price mismatch, quantity mismatch, PO not found, ambiguous vendor)
+- Duplicate detection (found, not found, different vendor, empty inputs)
+- Deterministic agent workflow (clean invoice, missing PO, PO dependency, duplicates, blurry document, ambiguous vendor, termination, max tool calls, tool failure, no repeated calls)
+- LLM tool-calling workflow (tool order, PO dependency, hallucination rejection, override prevention, max tool calls)
+- API behavior (health, clean invoice, unsupported format, with instruction)
+- Edge cases (tool loop proof, no hallucination, mismatch detection, ambiguity handling, clean termination, vague requests)
 
-Returns:
-
-```json
-{
-  "status": "UNIQUE",
-  "matches": [{ "vendor_id": "V-101", "name": "...", "tax_id": "..." }]
-}
+```bash
+python -m pytest tests/ -v
 ```
 
-Statuses: `UNIQUE`, `NONE`, `AMBIGUOUS`.
-
-### lookup_purchase_order(po_number)
-
-Returns:
-
-```json
-{
-  "status": "FOUND",
-  "po_number": "PO-88021",
-  "vendor_id": "V-101",
-  "currency": "USD",
-  "status": "OPEN",
-  "line_items": [...],
-  "expected_total": 1250.00
-}
-```
-
-### match_invoice_to_po(extraction, po_data, vendor_matches?)
-
-Returns `MatchResult` with explicit checks:
-
-```json
-{
-  "overall": "PASS",
-  "checks": {
-    "vendor_match": "PASS",
-    "po_number_match": "PASS",
-    "currency_match": "PASS",
-    "line_items_match": "PASS",
-    "quantity_match": "PASS",
-    "unit_price_match": "PASS",
-    "total_match": "PASS"
-  },
-  "exceptions": []
-}
-```
-
-### check_duplicate_invoice(vendor_id, invoice_number)
-
-Returns:
-
-```json
-{
-  "duplicate": false,
-  "matches": []
-}
-```
-
-## 8. No-hallucination behavior
-
-The system never invents:
-
-- invoice numbers
-- vendor names or IDs
-- PO numbers or amounts
-- totals, tax, or quantities
-- duplicate records
-
-If a value cannot be reliably extracted or looked up, the field returns `null` with status `MISSING`, `UNREADABLE`, or `UNCERTAIN`. The agent explains what prevented reliable processing in the final message.
-
-### LLM argument validation
-
-Before any tool is executed, arguments are validated against the current agent state:
-
-- `lookup_purchase_order` cannot be called with a PO number that does not match the extracted value.
-- `lookup_vendor` cannot be called with a name that does not match the extracted value.
-- `match_invoice_to_po` cannot be called without successful PO data.
-- `check_duplicate_invoice` cannot be called without a uniquely resolved vendor.
-
-If validation fails, the tool call is rejected with a structured error and the agent terminates or chooses an alternative.
-
-### Final decision validator
-
-Before returning the final result, a deterministic validator enforces:
-
-- If the document is unreadable → cannot return `READY_FOR_REVIEW`
-- If the vendor is ambiguous → cannot return `READY_FOR_REVIEW`
-- If PO mismatch exists → cannot return `READY_FOR_REVIEW`
-- If duplicate exists → cannot return `READY_FOR_REVIEW`
-- If required evidence is missing → cannot return `READY_FOR_REVIEW`
-
-This protects the system from LLM mistakes.
-
-## 9. Error handling
-
-All tools return structured results. If a tool raises an unexpected exception, the agent catches it and returns `NEEDS_REVIEW` with `TOOL_FAILURE`. Raw tracebacks are never exposed to the API consumer.
-
-## 10. Dataset / fixture structure
-
-Local fixture files in `app/data/`:
-
-- `vendors.json` — 5 vendors, including ambiguous duplicates.
-- `purchase_orders.json` — 4 POs with varying totals and vendors.
-- `processed_invoices.json` — 4 processed invoices including one duplicate pair.
-
-Test fixtures in `tests/fixtures/`:
-
-- `clean_invoice_01.pdf` — clean invoice with PO (duplicate).
-- `clean_invoice_02.pdf` — second clean invoice.
-- `clean_invoice_03.pdf` — clean invoice for READY_FOR_REVIEW demo.
-- `blurry_invoice.png` — image without OCR (simulates scanned doc).
-- `blank_invoice.pdf` — empty document.
-- `partial_invoice.pdf` — cropped document with missing totals.
-- `rotated_invoice.pdf` — rotated text layout.
-- `wrong_total_invoice.pdf` — invoice with mismatched total.
-
-## 11. How to install
+## 15. How to install
 
 ```bash
 python -m venv .venv
@@ -299,7 +491,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## 12. How to configure environment variables
+## 16. How to configure environment variables
 
 Copy `.env.example` to `.env` and set values as needed. No API keys are required for the core functionality (all business data is local fixture data).
 
@@ -312,7 +504,7 @@ Set `AGENT_MODE` to control orchestration:
 - `deterministic` — uses the built-in state machine (default, no API key needed).
 - `llm` — uses an LLM for tool selection (requires `OPENAI_API_KEY`).
 
-## 13. How to run
+## 17. How to run
 
 ### API (FastAPI)
 
@@ -342,137 +534,13 @@ python -m app.cli path/to/invoice.pdf --instruction "Check this." --json
 python -m app.cli path/to/invoice.pdf --mode llm
 ```
 
-## 14. How to run tests
-
-```bash
-python -m pytest tests/ -v
-```
-
-All tests run offline without requiring an LLM API key.
-
-## 15. Example successful workflow
-
-```text
-Upload clean_invoice_03.pdf
-       ↓
-inspect_document → supported=true, readable=true
-       ↓
-extract_invoice → INV-8888, PO-88021, total=1250.00
-       ↓
-lookup_vendor → UNIQUE (V-101 Acme Supplies Pvt Ltd)
-       ↓
-lookup_purchase_order → FOUND PO-88021, expected_total=1250.00
-       ↓
-match_invoice_to_po → overall=PASS
-       ↓
-check_duplicate_invoice → duplicate=false
-       ↓
-READY_FOR_REVIEW
-```
-
-Tool trace:
-
-```text
-1. inspect_document
-2. extract_invoice
-3. lookup_vendor
-4. lookup_purchase_order
-5. match_invoice_to_po
-6. check_duplicate_invoice
-7. final decision
-```
-
-## 16. Example blurry-document workflow
-
-```text
-Upload blurry_invoice.png
-       ↓
-inspect_document → NO_TEXT_DETECTED
-       ↓
-NEEDS_REVIEW
-       ↓
-Message: "No text detected; document may be scanned without OCR."
-```
-
-## 17. Example mismatch workflow
-
-```text
-Upload wrong_total_invoice.pdf
-       ↓
-inspect_document → readable
-       ↓
-extract_invoice → INV-9999, PO-88024, total=1750.00
-       ↓
-lookup_vendor → UNIQUE (V-104 Beta Logistics Ltd)
-       ↓
-lookup_purchase_order → FOUND PO-88024, expected_total=1500.00
-       ↓
-match_invoice_to_po → overall=FAIL, TOTAL_MISMATCH
-       ↓
-NEEDS_REVIEW
-```
-
-## 18. Example LLM orchestration workflow
-
-```text
-User uploads invoice
-       ↓
-LLM decides: call inspect_document
-       ↓
-Tool result: supported=true, readable=true
-       ↓
-LLM decides: call extract_invoice
-       ↓
-Tool result: PO-88021 extracted
-       ↓
-LLM decides: call lookup_purchase_order with PO-88021
-       ↓
-Validator checks: PO-88021 matches extracted value
-       ↓
-Tool result: PO found, expected_total=1250.00
-       ↓
-LLM decides: call match_invoice_to_po
-       ↓
-Tool result: overall=PASS
-       ↓
-LLM decides: final decision READY_FOR_REVIEW
-       ↓
-Validator checks: no mismatches, no duplicates
-       ↓
-READY_FOR_REVIEW
-```
-
-## 19. Example LLM hallucination attempt
-
-```text
-LLM attempts: lookup_purchase_order("PO-FAKE")
-       ↓
-Validator checks: extracted po_number = null
-       ↓
-Rejected: UNSUPPORTED_TOOL_ARGUMENT
-       ↓
-Agent terminates: NEEDS_REVIEW
-```
-
-## 20. Example LLM override attempt
-
-```text
-match_invoice_to_po → TOTAL_MISMATCH
-       ↓
-LLM attempts: final decision READY_FOR_REVIEW
-       ↓
-Validator checks: deterministic mismatch exists
-       ↓
-Overridden: NEEDS_REVIEW
-```
-
-## 21. Known limitations
+## 18. Known limitations
 
 - OCR requires Tesseract to be installed separately. Images without a text layer are treated as `NO_TEXT_DETECTED`.
 - The extraction layer uses regex-based parsing. It works reliably for well-formatted invoices but may miss fields on heavily stylized documents.
 - Business data is stored in local JSON fixtures. In production, vendor and PO lookups would query an ERP.
 - The deterministic mode is fully offline and reproducible. The LLM mode requires an OpenAI-compatible API key.
 
-## 22. License
+## 19. License
 
 MIT
